@@ -1,0 +1,9 @@
+name: "CodeQL Config - flask-webgoat"
+
+paths-ignore:
+  - tests/**
+  - .venv/**
+  - .github/**
+
+queries:
+  - uses: security-extended

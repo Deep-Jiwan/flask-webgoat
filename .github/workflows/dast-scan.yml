@@ -1,0 +1,143 @@
+name: DAST Security Scan
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 2 * * 0'
+
+jobs:
+  dast-scan:
+    name: Run DAST Analysis with ZAP
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      security-events: write
+      actions: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install "Flask>=2.0,<3.0" "Werkzeug>=2.0,<3.0" "Jinja2>=3.0" "itsdangerous>=2.0" "click>=8.0"
+
+      - name: Start Flask application
+        run: |
+          nohup python run.py > app.log 2>&1 &
+          echo $! > app.pid
+          echo "Waiting for Flask app to start..."
+          for i in {1..30}; do
+            if curl -sf http://localhost:5000/status > /dev/null 2>&1; then
+              echo "Flask app is up on localhost:5000"
+              exit 0
+            fi
+            echo "Attempt $i/30: not ready yet..."
+            sleep 2
+          done
+          echo "Flask app failed to start"
+          cat app.log
+          exit 1
+
+      - name: Prepare Docker volume
+        run: |
+          docker volume rm dast-reports-vol 2>/dev/null || true
+          docker volume create dast-reports-vol
+          docker rm -f zap-scan 2>/dev/null || true
+
+      - name: Run OWASP ZAP Full Scan
+        run: |
+          docker run --name zap-scan \
+            --network=host \
+            --user root \
+            -v "dast-reports-vol:/zap/wrk:rw" \
+            zaproxy/zap-stable zap-full-scan.py \
+            -t http://localhost:5000/ \
+            -r full-scan-report.html \
+            -w full-scan-report.md \
+            -J full-scan-report.json \
+            -x full-scan-report.xml \
+            -a \
+            -j \
+            -m 10 \
+            -z "-config api.disablekey=true \
+                -config scanner.attackStrength=HIGH \
+                -config scanner.alertThreshold=LOW \
+                -config spider.maxDuration=60 \
+                -config scanner.maxRuleDurationInMins=60 \
+                -config scanner.threadPerHost=5 \
+                -config ajaxSpider.numberOfBrowsers=1 \
+                -config ajaxSpider.maxDuration=10"
+        continue-on-error: true
+
+      - name: Copy reports from Docker volume
+        run: |
+          mkdir -p dast-reports
+          docker cp zap-scan:/zap/wrk/. dast-reports/ || echo "Failed to copy reports"
+          docker rm -f zap-scan 2>/dev/null || true
+          docker volume rm dast-reports-vol 2>/dev/null || true
+
+      - name: Save DAST results
+        run: |
+          mkdir -p results_files/dasts
+          BRANCH_NAME="${{ github.ref_name }}"
+          rm -f results_files/dasts/${BRANCH_NAME}_dast.json
+          if [ -f dast-reports/full-scan-report.json ]; then
+            cp dast-reports/full-scan-report.json results_files/dasts/${BRANCH_NAME}_dast.json
+            echo "DAST JSON saved"
+          else
+            echo "Warning: full-scan-report.json not found"
+            ls -lh dast-reports/ || true
+          fi
+
+      - name: Commit DAST results
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add results_files/
+          git commit -m "Add DAST results for ${{ github.ref_name }} [skip ci]" || echo "No changes to commit"
+          git pull --rebase origin ${{ github.ref_name }} || echo "No remote changes"
+          git push || echo "Nothing to push"
+
+      - name: Stop Flask application
+        if: always()
+        run: |
+          if [ -f app.pid ]; then
+            kill $(cat app.pid) 2>/dev/null || true
+            sleep 2
+            kill -9 $(cat app.pid) 2>/dev/null || true
+            rm app.pid
+          fi
+
+      - name: Upload DAST artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dast-results
+          path: |
+            dast-reports/full-scan-report.json
+            dast-reports/full-scan-report.html
+          retention-days: 30
+
+      - name: Check high-severity findings
+        if: always()
+        run: |
+          if [ -f dast-reports/full-scan-report.json ]; then
+            HIGH=$(jq '[.site[].alerts[] | select(.riskcode == "3")] | length' dast-reports/full-scan-report.json 2>/dev/null || echo "0")
+            echo "High severity findings: $HIGH"
+          fi
+
+      - name: Scan summary
+        if: always()
+        run: |
+          echo "## DAST Scan Complete" >> $GITHUB_STEP_SUMMARY
+          echo "**Tool:** OWASP ZAP Full Active Scan" >> $GITHUB_STEP_SUMMARY
+          echo "**Target:** http://localhost:5000/" >> $GITHUB_STEP_SUMMARY
+          echo "**Attack Strength:** HIGH | **Threshold:** LOW" >> $GITHUB_STEP_SUMMARY
+          echo "**Branch:** ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY

@@ -1,0 +1,111 @@
+name: SAST Security Scan
+
+on:
+  push:
+    branches: [ master ]
+  workflow_dispatch:
+
+jobs:
+  sast-scan:
+    name: Run SAST Analysis
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      security-events: write
+      actions: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: python
+          config-file: ./.github/codeql-config.yml
+        env:
+          CODEQL_RAM: 4096
+          CODEQL_THREADS: 4
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: codeql-python
+          output: sarif-results
+          upload: false
+
+      - name: Save SARIF file
+        run: |
+          mkdir -p results_files/sasts
+          BRANCH_NAME="${{ github.ref_name }}"
+          rm -f results_files/sasts/${BRANCH_NAME}.sarif
+          find sarif-results -name "*.sarif" -exec cp {} results_files/sasts/${BRANCH_NAME}.sarif \;
+          ls -lh results_files/sasts/
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install "Flask>=2.0,<3.0" "Werkzeug>=2.0,<3.0" "Jinja2>=3.0" "itsdangerous>=2.0" "click>=8.0"
+          pip install pylint pytest pytest-flask
+
+      - name: Run Pylint
+        continue-on-error: true
+        run: |
+          mkdir -p results_files/pylint
+          BRANCH_NAME="${{ github.ref_name }}"
+          rm -f results_files/pylint/${BRANCH_NAME}_lint.json
+          pylint flask_webgoat/ run.py > pylint_output.txt 2>&1 || true
+          SCORE=$(grep -oP 'rated at \K[0-9.]+(?=/10)' pylint_output.txt || echo "N/A")
+          echo "{\"score\": \"$SCORE/10\"}" > results_files/pylint/${BRANCH_NAME}_lint.json
+          echo "Pylint score: $SCORE/10"
+          cat pylint_output.txt
+
+      - name: Run Pytest
+        continue-on-error: true
+        run: |
+          mkdir -p results_files/pytest
+          BRANCH_NAME="${{ github.ref_name }}"
+          rm -f results_files/pytest/${BRANCH_NAME}_pytest.json
+          pytest tests/ -v > pytest_output.txt 2>&1 || true
+          PASSED=$(grep -oP '\K[0-9]+(?= passed)' pytest_output.txt || echo "0")
+          FAILED=$(grep -oP '\K[0-9]+(?= failed)' pytest_output.txt || echo "0")
+          echo "{\"passed\": $PASSED, \"failed\": $FAILED}" > results_files/pytest/${BRANCH_NAME}_pytest.json
+          echo "Pytest: $PASSED passed, $FAILED failed"
+          cat pytest_output.txt
+
+      - name: Commit results
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add results_files/
+          git commit -m "Add SAST, Pylint, and Pytest results [skip ci]" || echo "No changes to commit"
+          git pull --rebase origin ${{ github.ref_name }} || echo "No remote changes"
+          git push || echo "Nothing to push"
+
+      - name: Upload SARIF artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sast-results
+          path: results_files/sasts/${{ github.ref_name }}.sarif
+          retention-days: 30
+
+      - name: Upload SARIF to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        continue-on-error: true
+        with:
+          sarif_file: results_files/sasts/${{ github.ref_name }}.sarif
+          category: codeql
+
+      - name: Scan summary
+        if: always()
+        run: |
+          echo "## SAST Scan Complete" >> $GITHUB_STEP_SUMMARY
+          echo "**Tool:** CodeQL (Python security-extended)" >> $GITHUB_STEP_SUMMARY
+          echo "**Branch:** ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
