@@ -1,0 +1,141 @@
+---
+# ZAP Automation Framework Plan - flask-webgoat
+# Authenticated scan: form-based login as admin/admin
+# Seeds all POST-only API endpoints (invisible to the passive spider)
+
+env:
+  contexts:
+  - name: "flask-webgoat"
+    urls:
+    - "http://localhost:5000"
+    includePaths:
+    - "http://localhost:5000.*"
+    authentication:
+      method: "form"
+      parameters:
+        loginPageUrl: "http://localhost:5000/login"
+        loginRequestUrl: "http://localhost:5000/login"
+        loginRequestBody: "username={%username%}&password={%password%}"
+      verification:
+        method: "response"
+        loggedInRegex: "\"success\":\\s*true"
+        loggedOutRegex: "\"bad_login\":\\s*true"
+        pollFrequency: 60
+        pollUnits: "requests"
+    sessionManagement:
+      method: "cookie"
+    users:
+    - name: "admin"
+      credentials:
+        username: "admin"
+        password: "admin"
+  parameters:
+    failOnError: false
+    failOnWarning: false
+    progressToStdout: true
+  vars: {}
+
+jobs:
+
+# ──────────────────────────────────────────────────────────────────
+# STEP 1: Seed all API endpoints into ZAP's site tree.
+#
+# ZAP's passive spider follows HTML links and forms — it cannot
+# discover POST-only JSON/form endpoints. We manually register
+# every vulnerable endpoint here so the active scanner can attack
+# their parameters.
+#
+# Vulnerabilities targeted:
+#   /login               → CWE-089 SQL Injection (username, password params)
+#   /login_and_redirect  → CWE-601 Open Redirect (url param, GET)
+#   /create_user         → CWE-089 SQL Injection (access_level param)
+#   /message             → CWE-022 Path Traversal (filename param)
+#   /grep_processes      → CWE-078 Command Injection (process_name param)
+#   /deserialized_descr  → CWE-502 Insecure Deserialization (description)
+#   /search              → parameterized — safe baseline
+# ──────────────────────────────────────────────────────────────────
+- type: requestor
+  name: "Seed API Endpoints"
+  parameters:
+    user: "admin"
+  requests:
+  # Public / status
+  - url: "http://localhost:5000/"
+    method: "GET"
+  - url: "http://localhost:5000/status"
+    method: "GET"
+  - url: "http://localhost:5000/ping"
+    method: "GET"
+  # Search (safe parameterized query — good baseline)
+  - url: "http://localhost:5000/search?q=test"
+    method: "GET"
+  # Auth — SQLi target (POST form)
+  - url: "http://localhost:5000/login"
+    method: "POST"
+    data: "username=admin&password=admin"
+  # Open Redirect (GET with query params — triggers on bad creds)
+  - url: "http://localhost:5000/login_and_redirect?username=wrong&password=wrong&url=http%3A%2F%2Flocalhost%3A5000%2F"
+    method: "GET"
+  # User creation — SQLi via %d in access_level (POST form, auth required)
+  - url: "http://localhost:5000/create_user"
+    method: "POST"
+    data: "username=zaptest&password=zaptest&access_level=1"
+  # Path traversal — filename parameter (POST form, auth required)
+  - url: "http://localhost:5000/message"
+    method: "POST"
+    data: "filename=zaptest.txt&text=hello+from+zap"
+  # Command injection — process_name parameter (POST form, auth required)
+  - url: "http://localhost:5000/grep_processes"
+    method: "POST"
+    data: "process_name=python"
+  # Insecure deserialization — description is base64-encoded pickle (POST form)
+  # ZAP will not detect CWE-502 (no pickle-aware scanner), but this adds
+  # the endpoint to the tree for any generic injection checks.
+  - url: "http://localhost:5000/deserialized_descr"
+    method: "POST"
+    data: "description=dGVzdA=="
+
+# ──────────────────────────────────────────────────────────────────
+# STEP 2: Traditional spider (authenticated)
+# Discovers any HTML pages / links ZAP can follow as admin
+# ──────────────────────────────────────────────────────────────────
+- type: spider
+  name: "Spider (Authenticated)"
+  parameters:
+    context: "flask-webgoat"
+    user: "admin"
+    maxDuration: 5
+    maxDepth: 5
+    maxChildren: 20
+
+# ──────────────────────────────────────────────────────────────────
+# STEP 3: Active scan — the main attack phase
+# Runs as authenticated admin user against all seeded endpoints
+# Attack strength HIGH = more payloads per parameter
+# Alert threshold LOW  = report even low-confidence findings
+# ──────────────────────────────────────────────────────────────────
+- type: activeScan
+  name: "Active Scan (Authenticated, HIGH strength)"
+  parameters:
+    context: "flask-webgoat"
+    user: "admin"
+    attackStrength: "HIGH"
+    alertThreshold: "LOW"
+    maxRuleDurationInMins: 10
+    threadPerHost: 5
+
+# ──────────────────────────────────────────────────────────────────
+# STEP 4: Generate JSON report
+# Written to /zap/wrk/ which maps to GITHUB_WORKSPACE in CI
+# ──────────────────────────────────────────────────────────────────
+- type: report
+  name: "JSON Report"
+  parameters:
+    template: "traditional-json"
+    reportDir: "/zap/wrk"
+    reportFile: "full-scan-report.json"
+  risks:
+  - high
+  - medium
+  - low
+  - informational
