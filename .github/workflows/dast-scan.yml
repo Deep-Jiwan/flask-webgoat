@@ -1,4 +1,4 @@
-name: DAST Security Scan
+name: DAST Security Scan (Authenticated)
 
 on:
   workflow_dispatch:
@@ -7,7 +7,7 @@ on:
 
 jobs:
   dast-scan:
-    name: Run DAST Analysis with ZAP
+    name: Run DAST Analysis with ZAP (Authenticated)
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -45,55 +45,40 @@ jobs:
           cat app.log
           exit 1
 
-      - name: Prepare Docker volume
+      - name: Verify admin credentials work
         run: |
-          docker volume rm dast-reports-vol 2>/dev/null || true
-          docker volume create dast-reports-vol
-          docker rm -f zap-scan 2>/dev/null || true
+          # Confirm admin/admin login succeeds before handing off to ZAP
+          RESPONSE=$(curl -s -X POST http://localhost:5000/login \
+            -d "username=admin&password=admin" \
+            -H "Content-Type: application/x-www-form-urlencoded")
+          echo "Login response: $RESPONSE"
+          echo "$RESPONSE" | grep -q '"success"' && echo "Admin login OK" || echo "WARNING: login check failed"
 
-      - name: Run OWASP ZAP Full Scan
+      - name: Run OWASP ZAP (Automation Framework - Authenticated)
         run: |
+          # Mount GITHUB_WORKSPACE as /zap/wrk so ZAP can read .zap/af-plan.yaml
+          # and write the report directly to the workspace.
+          # --network=host lets ZAP reach localhost:5000 (the Flask app).
           docker run --name zap-scan \
             --network=host \
             --user root \
-            -v "dast-reports-vol:/zap/wrk:rw" \
-            zaproxy/zap-stable zap-full-scan.py \
-            -t http://localhost:5000/ \
-            -r full-scan-report.html \
-            -w full-scan-report.md \
-            -J full-scan-report.json \
-            -x full-scan-report.xml \
-            -a \
-            -j \
-            -m 10 \
-            -z "-config api.disablekey=true \
-                -config scanner.attackStrength=HIGH \
-                -config scanner.alertThreshold=LOW \
-                -config spider.maxDuration=60 \
-                -config scanner.maxRuleDurationInMins=60 \
-                -config scanner.threadPerHost=5 \
-                -config ajaxSpider.numberOfBrowsers=1 \
-                -config ajaxSpider.maxDuration=10"
+            -v "${GITHUB_WORKSPACE}:/zap/wrk:rw" \
+            zaproxy/zap-stable zap.sh -cmd \
+            -autorun /zap/wrk/.zap/af-plan.yaml \
+            -config api.disabledkey=true
         continue-on-error: true
-
-      - name: Copy reports from Docker volume
-        run: |
-          mkdir -p dast-reports
-          docker cp zap-scan:/zap/wrk/. dast-reports/ || echo "Failed to copy reports"
-          docker rm -f zap-scan 2>/dev/null || true
-          docker volume rm dast-reports-vol 2>/dev/null || true
 
       - name: Save DAST results
         run: |
           mkdir -p results_files/dasts
           BRANCH_NAME="${{ github.ref_name }}"
           rm -f results_files/dasts/${BRANCH_NAME}_dast.json
-          if [ -f dast-reports/full-scan-report.json ]; then
-            cp dast-reports/full-scan-report.json results_files/dasts/${BRANCH_NAME}_dast.json
-            echo "DAST JSON saved"
+          if [ -f full-scan-report.json ]; then
+            cp full-scan-report.json results_files/dasts/${BRANCH_NAME}_dast.json
+            echo "DAST JSON saved ($(wc -c < full-scan-report.json) bytes)"
           else
-            echo "Warning: full-scan-report.json not found"
-            ls -lh dast-reports/ || true
+            echo "WARNING: full-scan-report.json not found"
+            ls -lh . || true
           fi
 
       - name: Commit DAST results
@@ -101,7 +86,7 @@ jobs:
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
           git add results_files/
-          git commit -m "Add DAST results for ${{ github.ref_name }} [skip ci]" || echo "No changes to commit"
+          git commit -m "Add DAST results (authenticated) for ${{ github.ref_name }} [skip ci]" || echo "No changes to commit"
           git pull --rebase origin ${{ github.ref_name }} || echo "No remote changes"
           git push || echo "Nothing to push"
 
@@ -119,25 +104,28 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: dast-results
+          name: dast-results-authenticated
           path: |
-            dast-reports/full-scan-report.json
-            dast-reports/full-scan-report.html
+            full-scan-report.json
           retention-days: 30
-
-      - name: Check high-severity findings
-        if: always()
-        run: |
-          if [ -f dast-reports/full-scan-report.json ]; then
-            HIGH=$(jq '[.site[].alerts[] | select(.riskcode == "3")] | length' dast-reports/full-scan-report.json 2>/dev/null || echo "0")
-            echo "High severity findings: $HIGH"
-          fi
 
       - name: Scan summary
         if: always()
         run: |
-          echo "## DAST Scan Complete" >> $GITHUB_STEP_SUMMARY
-          echo "**Tool:** OWASP ZAP Full Active Scan" >> $GITHUB_STEP_SUMMARY
+          echo "## DAST Scan Complete (Authenticated)" >> $GITHUB_STEP_SUMMARY
+          echo "**Tool:** OWASP ZAP Automation Framework" >> $GITHUB_STEP_SUMMARY
+          echo "**Mode:** Form-based auth (admin/admin) + endpoint seeding" >> $GITHUB_STEP_SUMMARY
           echo "**Target:** http://localhost:5000/" >> $GITHUB_STEP_SUMMARY
           echo "**Attack Strength:** HIGH | **Threshold:** LOW" >> $GITHUB_STEP_SUMMARY
           echo "**Branch:** ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          if [ -f full-scan-report.json ]; then
+            HIGH=$(jq '[.site[].alerts[] | select(.riskcode == "3")] | length' full-scan-report.json 2>/dev/null || echo "0")
+            MED=$(jq '[.site[].alerts[] | select(.riskcode == "2")] | length' full-scan-report.json 2>/dev/null || echo "0")
+            LOW=$(jq '[.site[].alerts[] | select(.riskcode == "1")] | length' full-scan-report.json 2>/dev/null || echo "0")
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "| Severity | Count |" >> $GITHUB_STEP_SUMMARY
+            echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+            echo "| High | $HIGH |" >> $GITHUB_STEP_SUMMARY
+            echo "| Medium | $MED |" >> $GITHUB_STEP_SUMMARY
+            echo "| Low | $LOW |" >> $GITHUB_STEP_SUMMARY
+          fi
